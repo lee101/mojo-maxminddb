@@ -4,11 +4,10 @@ Python owns the mapped database and all result buffers. Addresses cross the C
 ABI as Int values and are rebuilt as concrete, mutable-origin pointers here.
 """
 
-from std.algorithm import parallelize
 from std.sys import simd_width_of
 
-comptime BPtr = UnsafePointer[UInt8, AnyOrigin[mut=True]]
-comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
+comptime BPtr = Pointer[UInt8, AnyOrigin[mut=True]]
+comptime IPtr = Pointer[Int64, AnyOrigin[mut=True]]
 
 
 def read_node(
@@ -26,9 +25,9 @@ def read_node(
         if offset < 0 or offset + 3 > database_size:
             return -2
         return (
-            Int(database[offset]) << 16
-            | Int(database[offset + 1]) << 8
-            | Int(database[offset + 2])
+            Int(database[unsafe_offset=offset]) << 16
+            | Int(database[unsafe_offset=offset + 1]) << 8
+            | Int(database[unsafe_offset=offset + 2])
         )
 
     if record_size == 28:
@@ -37,16 +36,16 @@ def read_node(
             return -2
         if index == 0:
             return (
-                (Int(database[offset + 3]) >> 4) << 24
-                | Int(database[offset]) << 16
-                | Int(database[offset + 1]) << 8
-                | Int(database[offset + 2])
+                (Int(database[unsafe_offset=offset + 3]) >> 4) << 24
+                | Int(database[unsafe_offset=offset]) << 16
+                | Int(database[unsafe_offset=offset + 1]) << 8
+                | Int(database[unsafe_offset=offset + 2])
             )
         return (
-            (Int(database[offset + 3]) & 0x0F) << 24
-            | Int(database[offset + 4]) << 16
-            | Int(database[offset + 5]) << 8
-            | Int(database[offset + 6])
+            (Int(database[unsafe_offset=offset + 3]) & 0x0F) << 24
+            | Int(database[unsafe_offset=offset + 4]) << 16
+            | Int(database[unsafe_offset=offset + 5]) << 8
+            | Int(database[unsafe_offset=offset + 6])
         )
 
     if record_size == 32:
@@ -54,10 +53,10 @@ def read_node(
         if offset < 0 or offset + 4 > database_size:
             return -2
         return (
-            Int(database[offset]) << 24
-            | Int(database[offset + 1]) << 16
-            | Int(database[offset + 2]) << 8
-            | Int(database[offset + 3])
+            Int(database[unsafe_offset=offset]) << 24
+            | Int(database[unsafe_offset=offset + 1]) << 16
+            | Int(database[unsafe_offset=offset + 2]) << 8
+            | Int(database[unsafe_offset=offset + 3])
         )
 
     return -1
@@ -83,28 +82,30 @@ def find_one(
         or (bit_count != 32 and bit_count != 128)
         or (record_size != 24 and record_size != 28 and record_size != 32)
     ):
-        statuses[result_index] = -1
+        statuses[unsafe_offset=result_index] = -1
         return
 
     var node = start_node
     var bit_index = 0
     while bit_index < bit_count and node < node_count:
-        var byte = packed[bit_index >> 3]
+        var byte = packed[unsafe_offset=bit_index >> 3]
         var bit = Int((byte >> UInt8(7 - (bit_index & 7))) & UInt8(1))
         node = read_node(database, database_size, node, bit, record_size)
         if node < 0:
-            statuses[result_index] = Int64(node)
-            prefixes[result_index] = Int64(bit_index)
+            statuses[unsafe_offset=result_index] = Int64(node)
+            prefixes[unsafe_offset=result_index] = Int64(bit_index)
             return
         bit_index += 1
 
-    prefixes[result_index] = Int64(bit_index)
+    prefixes[unsafe_offset=result_index] = Int64(bit_index)
     if node < node_count:
-        statuses[result_index] = -3
+        statuses[unsafe_offset=result_index] = -3
         return
 
-    pointers[result_index] = Int64(0 if node == node_count else node)
-    statuses[result_index] = 0
+    pointers[unsafe_offset=result_index] = Int64(
+        0 if node == node_count else node
+    )
+    statuses[unsafe_offset=result_index] = 0
 
 
 def find_value(
@@ -157,7 +158,7 @@ def find_ipv4_simd[W: Int](
     results: IPtr,
     base: Int,
 ):
-    var addresses = values.load[width=W](base)
+    var addresses = values.unsafe_load[width=W](base)
     var nodes = SIMD[DType.int64, W](start_node)
     var depths = SIMD[DType.int64, W](0)
     var statuses = SIMD[DType.int64, W](0)
@@ -171,7 +172,7 @@ def find_ipv4_simd[W: Int](
         var bits = (
             addresses >> SIMD[DType.int64, W](31 - bit_index)
         ) & SIMD[DType.int64, W](1)
-        comptime for lane in range(W):
+        for lane in range(W):
             if active[lane]:
                 var node = read_node(
                     database,
@@ -187,7 +188,7 @@ def find_ipv4_simd[W: Int](
                     depths[lane] += 1
 
     var encoded = SIMD[DType.int64, W](0)
-    comptime for lane in range(W):
+    for lane in range(W):
         if statuses[lane] != 0:
             encoded[lane] = statuses[lane]
         elif nodes[lane] < Int64(node_count):
@@ -197,7 +198,7 @@ def find_ipv4_simd[W: Int](
                 0 if nodes[lane] == Int64(node_count) else Int(nodes[lane])
             )
             encoded[lane] = Int64((pointer << 8) | Int(depths[lane]))
-    results.store(base, encoded)
+    results.unsafe_store(base, encoded)
 
 
 def find_ipv4_range(
@@ -225,11 +226,11 @@ def find_ipv4_range(
             i,
         )
     for i in range(simd_end, end):
-        results[i] = find_value(
+        results[unsafe_offset=i] = find_value(
             database,
             database_size,
             0,
-            Int(values[i]),
+            Int(values[unsafe_offset=i]),
             32,
             node_count,
             record_size,
@@ -317,38 +318,17 @@ def mmd_find_ipv4_many(
     var values = IPtr(unsafe_from_address=values_addr)
     var results = IPtr(unsafe_from_address=results_addr)
 
-    if count >= 16384:
-        comptime worker_count = 16
-
-        @parameter
-        def run_chunk(worker: Int):
-            var begin = count * worker // worker_count
-            var end = count * (worker + 1) // worker_count
-            find_ipv4_range(
-                database,
-                database_size,
-                values,
-                node_count,
-                record_size,
-                start_node,
-                results,
-                begin,
-                end,
-            )
-
-        parallelize[run_chunk](worker_count, worker_count)
-    else:
-        find_ipv4_range(
-            database,
-            database_size,
-            values,
-            node_count,
-            record_size,
-            start_node,
-            results,
-            0,
-            count,
-        )
+    find_ipv4_range(
+        database,
+        database_size,
+        values,
+        node_count,
+        record_size,
+        start_node,
+        results,
+        0,
+        count,
+    )
 
 
 @export("mmd_find_many")
@@ -385,33 +365,21 @@ def mmd_find_many(
     var prefixes = IPtr(unsafe_from_address=prefixes_addr)
     var statuses = IPtr(unsafe_from_address=statuses_addr)
 
-    @parameter
+    @__parameter
     def run_one(i: Int):
         find_one(
             database,
             database_size,
-            packed + i * 16,
-            Int(bit_counts[i]),
+            packed.unsafe_offset(i * 16),
+            Int(bit_counts[unsafe_offset=i]),
             node_count,
             record_size,
-            Int(start_nodes[i]),
+            Int(start_nodes[unsafe_offset=i]),
             pointers,
             prefixes,
             statuses,
             i,
         )
 
-    if count >= 16384:
-        comptime worker_count = 16
-
-        @parameter
-        def run_chunk(worker: Int):
-            var begin = count * worker // worker_count
-            var end = count * (worker + 1) // worker_count
-            for i in range(begin, end):
-                run_one(i)
-
-        parallelize[run_chunk](worker_count, worker_count)
-    else:
-        for i in range(count):
-            run_one(i)
+    for i in range(count):
+        run_one(i)
