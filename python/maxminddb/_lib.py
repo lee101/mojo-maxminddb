@@ -19,6 +19,7 @@ U = ctypes.c_uint64
 _SIGNATURES = {
     "mmd_find": ([I] * 10, None),
     "mmd_find_value": ([I, I, U, U, I, I, I, I], I),
+    "mmd_find_ipv4_value": ([I, U, I, I, I], I),
     "mmd_find_ipv4_many": ([I] * 8, None),
     "mmd_find_many": ([I] * 11, None),
 }

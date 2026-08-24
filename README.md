@@ -95,17 +95,19 @@ the same checked-in GeoIP2 City database and the best of three runs.
 
 | case | mojo-maxminddb | upstream maxminddb | speedup |
 | --- | ---: | ---: | ---: |
-| scalar `get`, 50k miss-heavy | 169.05 ms | 315.48 ms | 1.87x |
-| batch `get_many`, 50k miss-heavy | 45.23 ms | 342.56 ms | 7.57x |
-| scalar `get`, 10k GeoIP2 hits | 186.02 ms | 1616.77 ms | 8.69x |
-| batch `get_many`, 10k GeoIP2 hits | 278.75 ms | 1988.14 ms | 7.13x |
-| batch get + prefix, 50k miss-heavy | 73.48 ms | 437.75 ms | 5.96x |
+| scalar `get`, 50k miss-heavy | 126.47 ms | 252.91 ms | 2.00x |
+| batch `get_many`, 50k miss-heavy | 31.72 ms | 233.64 ms | 7.36x |
+| scalar `get`, 10k GeoIP2 hits | 180.99 ms | 1668.40 ms | 9.22x |
+| batch `get_many`, 10k GeoIP2 hits | 172.36 ms | 1668.87 ms | 9.68x |
+| batch get + prefix, 50k miss-heavy | 31.15 ms | 255.99 ms | 8.22x |
 
 Scalar traversal passes the address bits directly as integer arguments and
 returns pointer and prefix in one value, avoiding temporary NumPy arrays and
-three `ctypes` result objects per call. Homogeneous IPv4 batches traverse
-SIMD-width groups and use a scalar tail. Batches of at least 16,384 addresses
-are split into 16 coarse parallel chunks; smaller batches stay serial.
+three `ctypes` result objects per call. IPv4 lookup uses a dedicated five-argument
+ABI and dispatches the database record width once before traversing the trie.
+Homogeneous IPv4 batches traverse SIMD-width groups and use a scalar tail.
+Batches of at least 16,384 addresses are split into 16 coarse parallel chunks;
+smaller batches stay serial.
 
 The hit benchmark cycles through seven addresses. Decoded records seen more
 than once are retained as bounded templates and cloned with a type-specific

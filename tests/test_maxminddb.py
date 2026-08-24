@@ -367,3 +367,14 @@ def test_private_packed_ffi_rejects_wrong_shape_and_dtype():
             reader._find_packed(np.zeros(3, dtype=np.uint8), 32)
         with pytest.raises(ValueError, match="contiguous uint8"):
             reader._find_packed(np.zeros(16, dtype=np.uint8)[::2], 32)
+
+
+@pytest.mark.parametrize("record_size", [24, 28, 32])
+@pytest.mark.parametrize("ip_version", [4, 6])
+def test_ipv4_integer_abi_matches_packed_abi(record_size, ip_version):
+    path = DATA / f"MaxMind-DB-test-ipv{ip_version}-{record_size}.mmdb"
+    with maxminddb.open_database(path) as reader:
+        for value in IPV4_LOOKUPS:
+            address = ipaddress.IPv4Address(value)
+            packed = np.frombuffer(address.packed, dtype=np.uint8)
+            assert reader._find_integer(address) == reader._find_packed(packed, 32)

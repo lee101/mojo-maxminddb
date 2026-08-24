@@ -8,7 +8,7 @@ version = "0.1.0"
 [tasks]
 build = "bash build/build.sh"
 test = "python -m pytest tests -q"
-bench = "python -u bench/bench.py"
+bench = "flock /tmp/mojo-bench.lock python -u bench/bench.py"
 
 [activation.env]
 PYTHONPATH = "python"

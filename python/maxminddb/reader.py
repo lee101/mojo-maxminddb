@@ -139,6 +139,8 @@ class Reader:
                     break
                 node = self._read_node(node, 0)
         self._ipv4_start = node
+        self._mmd_find_ipv4_value = lib().mmd_find_ipv4_value
+        self._mmd_find_value = lib().mmd_find_value
 
     def metadata(self) -> Metadata:
         return self._metadata
@@ -248,6 +250,8 @@ class Reader:
     def _coerce_address(self, value):
         if isinstance(value, str):
             return ipaddress.ip_address(value)
+        if isinstance(value, (IPv4Address, IPv6Address)):
+            return value
         try:
             value.packed
             value.version
@@ -299,20 +303,25 @@ class Reader:
         self._ensure_readable()
         bit_count = address.max_prefixlen
         value = int(address)
-        encoded = lib().mmd_find_value(
-            self._address,
-            self._buffer_size,
-            value >> 64,
-            value & ((1 << 64) - 1),
-            bit_count,
-            self._metadata.node_count,
-            self._metadata.record_size,
-            (
-                self._ipv4_start
-                if self._metadata.ip_version == 6 and bit_count == 32
-                else 0
-            ),
-        )
+        if bit_count == 32:
+            encoded = self._mmd_find_ipv4_value(
+                self._address,
+                value,
+                self._metadata.node_count,
+                self._metadata.record_size,
+                self._ipv4_start if self._metadata.ip_version == 6 else 0,
+            )
+        else:
+            encoded = self._mmd_find_value(
+                self._address,
+                self._buffer_size,
+                value >> 64,
+                value & ((1 << 64) - 1),
+                bit_count,
+                self._metadata.node_count,
+                self._metadata.record_size,
+                0,
+            )
         if encoded < 0:
             self._raise_status(int(encoded))
         return int(encoded >> 8), int(encoded & 0xFF)

@@ -4,10 +4,52 @@ Python owns the mapped database and all result buffers. Addresses cross the C
 ABI as Int values and are rebuilt as concrete, mutable-origin pointers here.
 """
 
+from std.runtime import initialize_runtime
+from std.runtime.asyncrt import TaskGroup
 from std.sys import simd_width_of
 
 comptime BPtr = Pointer[UInt8, AnyOrigin[mut=True]]
 comptime IPtr = Pointer[Int64, AnyOrigin[mut=True]]
+comptime PARALLEL_THRESHOLD = 16_384
+comptime PARALLEL_CHUNKS = 16
+
+
+@always_inline
+def sync_parallelize[FuncType: def(Int) -> None](func: FuncType, count: Int):
+    @__parameter
+    @always_inline
+    def wrapped(i: Int):
+        func(i)
+
+    @always_inline
+    @__parameter
+    async def task_fn(i: Int):
+        wrapped(i)
+
+    var tasks = TaskGroup()
+    for i in range(count):
+        tasks.create_task(task_fn(i))
+    tasks.wait()
+
+
+@always_inline
+def parallelize[
+    origins: OriginSet,
+    //,
+    func: def(Int) capturing[origins] -> None,
+](num_work_items: Int, num_workers: Int):
+    def unified_func(i: Int):
+        func(i)
+
+    var chunk_size, extra_items = divmod(num_work_items, num_workers)
+
+    @always_inline
+    def worker(worker_index: Int) {imm chunk_size, imm extra_items}:
+        var start = worker_index * chunk_size + min(worker_index, extra_items)
+        for i in range(chunk_size + Int(worker_index < extra_items)):
+            unified_func(start + i)
+
+    sync_parallelize(worker, num_workers)
 
 
 def read_node(
@@ -129,18 +171,64 @@ def find_value(
 
     var node = start_node
     var bit_index = 0
-    while bit_index < bit_count and node < node_count:
-        var bit: Int
-        if bit_count == 32:
-            bit = (low >> (31 - bit_index)) & 1
-        elif bit_index < 64:
-            bit = (high >> (63 - bit_index)) & 1
-        else:
-            bit = (low >> (127 - bit_index)) & 1
-        node = read_node(database, database_size, node, bit, record_size)
-        if node < 0:
-            return Int64(node)
-        bit_index += 1
+    if record_size == 24:
+        while bit_index < bit_count and node < node_count:
+            var bit: Int
+            if bit_count == 32:
+                bit = (low >> (31 - bit_index)) & 1
+            elif bit_index < 64:
+                bit = (high >> (63 - bit_index)) & 1
+            else:
+                bit = (low >> (127 - bit_index)) & 1
+            var offset = node * 6 + bit * 3
+            node = (
+                Int(database[unsafe_offset=offset]) << 16
+                | Int(database[unsafe_offset=offset + 1]) << 8
+                | Int(database[unsafe_offset=offset + 2])
+            )
+            bit_index += 1
+    elif record_size == 28:
+        while bit_index < bit_count and node < node_count:
+            var bit: Int
+            if bit_count == 32:
+                bit = (low >> (31 - bit_index)) & 1
+            elif bit_index < 64:
+                bit = (high >> (63 - bit_index)) & 1
+            else:
+                bit = (low >> (127 - bit_index)) & 1
+            var offset = node * 7
+            if bit == 0:
+                node = (
+                    (Int(database[unsafe_offset=offset + 3]) >> 4) << 24
+                    | Int(database[unsafe_offset=offset]) << 16
+                    | Int(database[unsafe_offset=offset + 1]) << 8
+                    | Int(database[unsafe_offset=offset + 2])
+                )
+            else:
+                node = (
+                    (Int(database[unsafe_offset=offset + 3]) & 0x0F) << 24
+                    | Int(database[unsafe_offset=offset + 4]) << 16
+                    | Int(database[unsafe_offset=offset + 5]) << 8
+                    | Int(database[unsafe_offset=offset + 6])
+                )
+            bit_index += 1
+    else:
+        while bit_index < bit_count and node < node_count:
+            var bit: Int
+            if bit_count == 32:
+                bit = (low >> (31 - bit_index)) & 1
+            elif bit_index < 64:
+                bit = (high >> (63 - bit_index)) & 1
+            else:
+                bit = (low >> (127 - bit_index)) & 1
+            var offset = node * 8 + bit * 4
+            node = (
+                Int(database[unsafe_offset=offset]) << 24
+                | Int(database[unsafe_offset=offset + 1]) << 16
+                | Int(database[unsafe_offset=offset + 2]) << 8
+                | Int(database[unsafe_offset=offset + 3])
+            )
+            bit_index += 1
 
     if node < node_count:
         return -3
@@ -299,6 +387,28 @@ def mmd_find_value(
     )
 
 
+@export("mmd_find_ipv4_value")
+def mmd_find_ipv4_value(
+    database_addr: Int,
+    low: Int,
+    node_count: Int,
+    record_size: Int,
+    start_node: Int,
+) abi("C") -> Int64:
+    if database_addr == 0:
+        return -1
+    return find_value(
+        BPtr(unsafe_from_address=database_addr),
+        1,
+        0,
+        low,
+        32,
+        node_count,
+        record_size,
+        start_node,
+    )
+
+
 @export("mmd_find_ipv4_many")
 def mmd_find_ipv4_many(
     database_addr: Int,
@@ -318,17 +428,39 @@ def mmd_find_ipv4_many(
     var values = IPtr(unsafe_from_address=values_addr)
     var results = IPtr(unsafe_from_address=results_addr)
 
-    find_ipv4_range(
-        database,
-        database_size,
-        values,
-        node_count,
-        record_size,
-        start_node,
-        results,
-        0,
-        count,
-    )
+    if count >= PARALLEL_THRESHOLD:
+        var chunk_size = (count + PARALLEL_CHUNKS - 1) // PARALLEL_CHUNKS
+
+        @__parameter
+        def run_chunk(chunk: Int):
+            var begin = chunk * chunk_size
+            var end = min(begin + chunk_size, count)
+            find_ipv4_range(
+                database,
+                database_size,
+                values,
+                node_count,
+                record_size,
+                start_node,
+                results,
+                begin,
+                end,
+            )
+
+        initialize_runtime()
+        parallelize[run_chunk](PARALLEL_CHUNKS, PARALLEL_CHUNKS)
+    else:
+        find_ipv4_range(
+            database,
+            database_size,
+            values,
+            node_count,
+            record_size,
+            start_node,
+            results,
+            0,
+            count,
+        )
 
 
 @export("mmd_find_many")
@@ -381,5 +513,18 @@ def mmd_find_many(
             i,
         )
 
-    for i in range(count):
-        run_one(i)
+    if count >= PARALLEL_THRESHOLD:
+        var chunk_size = (count + PARALLEL_CHUNKS - 1) // PARALLEL_CHUNKS
+
+        @__parameter
+        def run_chunk(chunk: Int):
+            var begin = chunk * chunk_size
+            var end = min(begin + chunk_size, count)
+            for i in range(begin, end):
+                run_one(i)
+
+        initialize_runtime()
+        parallelize[run_chunk](PARALLEL_CHUNKS, PARALLEL_CHUNKS)
+    else:
+        for i in range(count):
+            run_one(i)
