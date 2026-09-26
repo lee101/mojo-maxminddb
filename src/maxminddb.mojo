@@ -4,52 +4,12 @@ Python owns the mapped database and all result buffers. Addresses cross the C
 ABI as Int values and are rebuilt as concrete, mutable-origin pointers here.
 """
 
-from std.runtime import initialize_runtime
-from std.runtime.asyncrt import TaskGroup
 from std.sys import simd_width_of
 
 comptime BPtr = Pointer[UInt8, AnyOrigin[mut=True]]
 comptime IPtr = Pointer[Int64, AnyOrigin[mut=True]]
 comptime PARALLEL_THRESHOLD = 16_384
 comptime PARALLEL_CHUNKS = 16
-
-
-@always_inline
-def sync_parallelize[FuncType: def(Int) -> None](func: FuncType, count: Int):
-    @__parameter
-    @always_inline
-    def wrapped(i: Int):
-        func(i)
-
-    @always_inline
-    @__parameter
-    async def task_fn(i: Int):
-        wrapped(i)
-
-    var tasks = TaskGroup()
-    for i in range(count):
-        tasks.create_task(task_fn(i))
-    tasks.wait()
-
-
-@always_inline
-def parallelize[
-    origins: OriginSet,
-    //,
-    func: def(Int) capturing[origins] -> None,
-](num_work_items: Int, num_workers: Int):
-    def unified_func(i: Int):
-        func(i)
-
-    var chunk_size, extra_items = divmod(num_work_items, num_workers)
-
-    @always_inline
-    def worker(worker_index: Int) {imm chunk_size, imm extra_items}:
-        var start = worker_index * chunk_size + min(worker_index, extra_items)
-        for i in range(chunk_size + Int(worker_index < extra_items)):
-            unified_func(start + i)
-
-    sync_parallelize(worker, num_workers)
 
 
 def read_node(
@@ -447,8 +407,8 @@ def mmd_find_ipv4_many(
                 end,
             )
 
-        initialize_runtime()
-        parallelize[run_chunk](PARALLEL_CHUNKS, PARALLEL_CHUNKS)
+        for chunk in range(PARALLEL_CHUNKS):
+            run_chunk(chunk)
     else:
         find_ipv4_range(
             database,
@@ -523,8 +483,8 @@ def mmd_find_many(
             for i in range(begin, end):
                 run_one(i)
 
-        initialize_runtime()
-        parallelize[run_chunk](PARALLEL_CHUNKS, PARALLEL_CHUNKS)
+        for chunk in range(PARALLEL_CHUNKS):
+            run_chunk(chunk)
     else:
         for i in range(count):
             run_one(i)

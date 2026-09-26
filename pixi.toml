@@ -14,7 +14,7 @@ bench = "flock /tmp/mojo-bench.lock python -u bench/bench.py"
 PYTHONPATH = "python"
 
 [dependencies]
-mojo = "==1.1.0.dev2026081105"
+mojo = "==1.2.0.dev2026092605"
 python = "3.13.*"
 pytest = "*"
 numpy = "*"
