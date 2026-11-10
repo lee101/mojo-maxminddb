@@ -275,11 +275,23 @@ than once are retained as bounded templates and cloned with a type-specific
 container copier, so returned dictionaries and lists remain independently
 mutable without repeatedly parsing the same MMDB values.
 
-There is intentionally no GPU path. Trie traversal performs only a few integer
-operations per unpredictable 6–8 byte node load, below the roughly two
-operations-per-byte threshold, while record decoding constructs Python
-objects. Device transfer and launch overhead therefore have no
-arithmetic-intensive work to amortize.
+**CPU only: memory-bound.** There is intentionally no GPU path, and this is a
+measurement rather than a preference. `bench/analysis.md` prices every hot path
+against the MMDB format's actual arithmetic (8 integer ops per trie node plus the
+width-specific 28-bit reassembly, over the 7 B node load and the address-bit
+extraction). The highest ratio anywhere in the profile is **1.15 flops/byte**,
+on the `find_value` and `mmd_find_ipv4_many` kernels; the mixed-width batch
+path is about 0.5 flops/byte, and record decode rows are at 0 flops/byte because
+their cost is Python object construction. Every row sits below the roughly two
+flops-per-byte gate, so nothing here is a GPU candidate: the whole 50k-miss
+kernel performs about 210k integer operations in 4.95 ms, which a single kernel
+launch plus the copy-in/copy-out of the 50k address and node-working buffers
+cannot beat. These lookups are latency-bound on a dependent chain of 5.2 (misses)
+to 27.4 (hits) unpredictable node loads, which is the opposite of the throughput
+pattern a GPU rewards. The device was available at the time of this decision
+(`nvidia-smi --query-gpu=memory.free` reported 4309 MiB free, so the shared-GPU
+memory gate was not the reason), and the current lever on these rows is the CPU
+one already taken: SIMD groups plus `parallelize` chunks for large batches.
 
 ## How it works
 
