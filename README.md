@@ -95,11 +95,11 @@ the same checked-in GeoIP2 City database and the best of three runs.
 
 | case | mojo-maxminddb | upstream maxminddb | speedup |
 | --- | ---: | ---: | ---: |
-| scalar `get`, 50k miss-heavy | 126.47 ms | 252.91 ms | 2.00x |
-| batch `get_many`, 50k miss-heavy | 31.72 ms | 233.64 ms | 7.36x |
-| scalar `get`, 10k GeoIP2 hits | 180.99 ms | 1668.40 ms | 9.22x |
-| batch `get_many`, 10k GeoIP2 hits | 172.36 ms | 1668.87 ms | 9.68x |
-| batch get + prefix, 50k miss-heavy | 31.15 ms | 255.99 ms | 8.22x |
+| scalar `get`, 50k miss-heavy | 121.46 ms | 257.50 ms | 2.12x |
+| batch `get_many`, 50k miss-heavy | 34.22 ms | 254.00 ms | 7.28x |
+| scalar `get`, 10k GeoIP2 hits | 190.91 ms | 1735.15 ms | 9.59x |
+| batch `get_many`, 10k GeoIP2 hits | 179.38 ms | 1772.94 ms | 9.88x |
+| batch get + prefix, 50k miss-heavy | 32.71 ms | 262.40 ms | 8.08x |
 
 ### SIMD phase: batch kernel before and after
 
