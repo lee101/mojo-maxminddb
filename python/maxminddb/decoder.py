@@ -27,8 +27,18 @@ class Decoder:
             )
 
     def _bytes(self, offset: int, size: int) -> bytes:
-        self._need(offset, size)
+        # Matches upstream maxminddb/decoder.py, which slices the buffer for
+        # value payloads: a declared size past the end truncates, it does not
+        # raise. Only the control bytes themselves are bounds-checked.
+        self._need(offset, 0)
         return bytes(self._buffer[offset : offset + size])
+
+    def _unpack(self, fmt: str, offset: int, size: int):
+        # Matches maxminddb/decoder.py `_decode_double` / `_decode_float`, which
+        # call struct.unpack on the raw slice, so a short payload raises
+        # struct.error rather than being zero-filled.
+        self._need(offset, 0)
+        return struct.unpack(fmt, self._buffer[offset : offset + size])[0], offset + size
 
     def decode(self, offset: int) -> tuple[Any, int]:
         return self._decode(offset, 0)
@@ -44,7 +54,9 @@ class Decoder:
             self._need(new_offset, 1)
             type_number = self._buffer[new_offset] + 7
             new_offset += 1
-            if type_number < 8:
+            # Matches maxminddb/decoder.py `_read_extended`, which rejects only
+            # type numbers below 7: extension byte 0 is the map type.
+            if type_number < 7:
                 raise InvalidDatabaseError(
                     "Something went horribly wrong in the decoder. An "
                     f"extended type resolved to a type number < 8 ({type_number})"
@@ -59,7 +71,8 @@ class Decoder:
             return value, new_offset + size
         if type_number == 3:
             self._verify_size(size, 8)
-            return struct.unpack("!d", self._bytes(new_offset, size))[0], new_offset + size
+            # Matches maxminddb/decoder.py `_decode_double`.
+            return self._unpack("!d", new_offset, size)
         if type_number == 4:
             return self._bytes(new_offset, size), new_offset + size
         if type_number in (5, 6, 9, 10):
@@ -73,9 +86,12 @@ class Decoder:
                 result[key] = value
             return result, new_offset
         if type_number == 8:
+            # Matches maxminddb/decoder.py `_decode_int32`: zero is zero, and a
+            # shortened payload is left-padded to 4 bytes before a signed read.
+            if size == 0:
+                return 0, new_offset
             raw = self._bytes(new_offset, size)
-            value = 0 if not raw else int.from_bytes(raw, "big", signed=size == 4)
-            return value, new_offset + size
+            return struct.unpack("!i", bytes(raw).rjust(4, b"\x00"))[0], new_offset + size
         if type_number == 11:
             result = []
             for _ in range(size):
@@ -86,7 +102,8 @@ class Decoder:
             return size != 0, new_offset
         if type_number == 15:
             self._verify_size(size, 4)
-            return struct.unpack("!f", self._bytes(new_offset, size))[0], new_offset + size
+            # Matches maxminddb/decoder.py `_decode_float`.
+            return self._unpack("!f", new_offset, size)
         raise InvalidDatabaseError(
             f"Unexpected type number ({type_number}) encountered"
         )

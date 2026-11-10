@@ -11,8 +11,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
 
 
-@pytest.fixture(scope="session")
-def upstream_maxminddb():
+def _load_upstream():
     candidates = [
         pathlib.Path(directory) / "maxminddb" / "__init__.py"
         for directory in site.getsitepackages()
@@ -44,9 +43,30 @@ def upstream_maxminddb():
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
+        decoder_module = importlib.import_module("maxminddb.decoder")
+        reader_module = importlib.import_module("maxminddb.reader")
     finally:
         for name in list(sys.modules):
             if name == "maxminddb" or name.startswith("maxminddb."):
                 del sys.modules[name]
         sys.modules.update(saved)
-    return module
+    return module, decoder_module, reader_module
+
+
+@pytest.fixture(scope="session")
+def upstream_maxminddb():
+    """The installed upstream `maxminddb` package, imported beside the port."""
+    return _load_upstream()[0]
+
+
+@pytest.fixture(scope="session")
+def upstream_decoder(upstream_maxminddb):
+    """Upstream's `maxminddb.decoder.Decoder`, for byte-level parity checks."""
+    return _load_upstream()[1].Decoder
+
+
+@pytest.fixture(scope="session")
+def upstream_reader_types(upstream_maxminddb):
+    """Upstream's `maxminddb.reader.Metadata` and `Reader` classes."""
+    module = _load_upstream()[2]
+    return module.Metadata, module.Reader
