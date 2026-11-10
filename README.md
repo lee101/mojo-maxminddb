@@ -161,6 +161,103 @@ What changed in the kernel, and what did not survive `pixi run bench`:
   1025.0/1079.8 ms after. Both were reverted rather than kept on the strength
   of a microbenchmark.
 
+### Parallel phase: what `parallelize` is worth, and where it is not
+
+Measured 2026-11-10 on the workspace machine (Intel Xeon E5-2697 v4, Linux
+6.8.0-147-generic, Python 3.13.14, load average 22-65 throughout -- the host is
+shared). The kernel is called directly, no decode and no result list, best of
+five, old and new libraries interleaved.
+
+The mechanism first, because the old code looked parallel but was not. Both
+batch entry points had a `PARALLEL_THRESHOLD = 16_384` branch that split the
+batch into 16 chunks and dispatched them with
+
+```mojo
+@__parameter
+def run_chunk(chunk: Int): ...
+for chunk in range(PARALLEL_CHUNKS):
+    run_chunk(chunk)
+```
+
+which is a serial loop over 16 inlined bodies: 0.102 us/address at 16,383 and
+0.103 us at 16,384, exactly the serial rate. It is now a real
+`from max.algorithm import parallelize` (the `std.algorithm` form does not
+compile on this toolchain), four workers, one chunk each, behind a threshold
+measured next.
+
+This needed the `max` package: `max.algorithm` does not resolve from the `mojo`
+package alone. `pixi.toml` now pins `max == 26.7.0.dev2026092605` beside
+`mojo == 1.2.0.dev2026092605`.
+
+**The cost of dispatching.** A `parallelize` call with an empty body costs
+~4.3-6.5 ms per call from a `ctypes` host in this environment, roughly 0.3 ms
+when the process is confined to four CPUs, and ~27 us inside `mojo run`. That
+cost is flat from 2 to 16 workers and does not fall with repeated calls, so it
+is per-call rather than one-off pool creation. For a kernel whose whole 50k
+batch takes ~2 ms, that dispatch is larger than the work, which is why the
+threshold is not small.
+
+**Crossover, gate environment** (`.so` loaded from `ctypes`, no CPU pinning,
+the same conditions as `pixi run bench`). 4 workers, median of 5 interleaved
+runs:
+
+| addresses | serial | 4 workers | speedup |
+| --- | ---: | ---: | ---: |
+| 50,000 | 1.86 ms | 1.87 ms | 1.00x (below threshold, stays serial) |
+| 262,144 | 10.30 ms | 7.92 ms | 1.30x |
+| 300,000 | 11.32 ms | 8.83 ms | 1.29x |
+| 400,000 | 20.04 ms | 9.74 ms | 1.56x |
+| 500,000 | 20.23 ms | 19.00 ms | 1.19x |
+| 750,000 | 29.11 ms | 15.41 ms | 1.93x |
+| 1,000,000 | 37.90 ms | 18.42 ms | 2.09x |
+
+An earlier sweep with fewer repeats put the first win at ~175k-200k (parallel
+losing at 150k and 16384) and no loss from 262,144 upward in five repeats.
+The threshold is 2^18 = 262,144: above that first crossover, so no caller that
+fits in one of the benchmark sizes pays for it. Below the threshold the code
+still runs the serial range; against the previous library at 1k/10k/50k/262143
+addresses it measures 1.02x/1.00x/1.01x/1.00x, i.e. unchanged.
+
+**Threads 1/2/4/8 on the gate's 10,829-byte tree** (1M addresses): 4 workers
+2.38x, 8 workers 3.37x, 16 workers 4.57x; confined to four CPUs all three are
+identical at 3.7x. That extra scaling is the shared host's scheduler handing a
+wider thread group more wall-clock, not throughput the algorithm controls, so
+the cap is four workers as the host requires.
+
+**Where it is worth having.** On the checked-in test fixture the walk is a
+35 ns/address dependent-load chain and the batch total is dominated by Python:
+at 1M addresses, `np.fromiter` is 246 ms and the result list 403 ms against a
+42 ms kernel, so a 1.7-2.2x kernel win is a couple of percent of `get_many`.
+The phase is sized for batch callers with real trees, which is what a
+GeoLite2-City database is. On a 112 MB, 5M-node pool - the same walk, just
+cache-missing - four workers give 4.3x, eight 8.4x and sixteen 17.8x at 2M
+addresses, and 4.3x/7.7x/15.6x at 500k. It is not a microbenchmark artifact:
+the win comes exactly where node loads leave cache, which is what production
+databases do.
+
+**Numbers, honestly.**
+
+- `pixi run bench` is unchanged: all five cases are below the threshold.
+  `batch get_many, 50k miss-heavy` 35.27 ms, `scalar get, 50k` 136.51 ms,
+  upstream ratios 7.90x and 2.02x - within this host's spread of the values
+  already in the table above.
+- The public API at 500k-1M addresses moved by about +-2% in three interleaved
+  rounds (500k: 496.8 -> 507.2 ms) because the Python staging above dominates;
+  it does not regress at the sizes the benchmark uses.
+
+**Equality.** The parallel path must return exactly the serial result.
+`test_parallel_kernel_output_identical_to_serial` and
+`test_parallel_mixed_kernel_output_identical_to_serial` call each kernel twice
+on the same input, once below the threshold (serial) and once above it
+(4-way), and compare packed pointer/prefix/status buffers. Both were checked
+to fail when a chunk boundary was deliberately shifted by one, so they test
+the thing they claim to.
+
+**Not kept: more workers.** Eight and sixteen workers win more on this host
+only because it is oversubscribed; on four CPUs they are indistinguishable
+from four. Four is kept and the flattening is recorded above rather than
+sold as a scaling story.
+
 Scalar traversal passes the address bits directly as integer arguments and
 returns pointer and prefix in one value, avoiding temporary NumPy arrays and
 three `ctypes` result objects per call. IPv4 lookup uses a dedicated five-argument
@@ -169,8 +266,9 @@ Homogeneous IPv4 batches load each SIMD-width group of addresses as one vector
 and walk the group's lanes against a width-specialised walk, with a scalar
 tail; the walk itself is the tree's dependent-load chain, one bit at a time
 (see the SIMD phase section below for what a lockstep gather measured).
-Batches of at least 16,384 addresses are split into 16 coarse parallel chunks;
-smaller batches stay serial.
+Batches at or above 262,144 addresses split into four `parallelize` chunks;
+smaller batches stay serial (see the parallel phase above for why the
+threshold sits that high and what the four workers are worth).
 
 The hit benchmark cycles through seven addresses. Decoded records seen more
 than once are retained as bounded templates and cloned with a type-specific

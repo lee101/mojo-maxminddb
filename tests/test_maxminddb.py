@@ -311,7 +311,7 @@ def test_batch_vector_boundaries(record_size, count):
 
 
 
-@pytest.mark.parametrize("count", [16383, 16384])
+@pytest.mark.parametrize("count", [262_143, 262_144, 262_145])
 @pytest.mark.parametrize("mixed_families", [False, True])
 def test_parallel_batch_threshold_matches_scalar(count, mixed_families):
     path = DATA / "GeoIP2-City-Test.mmdb"
@@ -335,6 +335,111 @@ def test_parallel_batch_threshold_matches_scalar(count, mixed_families):
             )
             for index, result in enumerate(actual)
         )
+
+
+def test_parallel_kernel_output_identical_to_serial():
+    """The `parallelize` path must write exactly what the serial path writes.
+
+    The batch entry point picks serial or parallel from the size threshold, so
+    the two cannot be compared through `get_with_prefix_len_many` alone. Here
+    the kernel is called directly on the same addresses - once with a count
+    below the threshold (serial) and once with the full count (4-way
+    `parallelize`) - and the packed pointer/prefix results must be identical.
+    Addresses alternate between known routes and random misses, so hit/miss
+    and depth boundaries straddle the chunk edges.
+    """
+    from maxminddb._lib import lib
+
+    path = DATA / "GeoIP2-City-Test.mmdb"
+    # Mirrors `PARALLEL_THRESHOLD` in src/maxminddb.mojo.
+    threshold = 262_144
+    count = threshold + 4096
+    rng = np.random.default_rng(20260730)
+    with maxminddb.open_database(path) as reader:
+        metadata = reader.metadata()
+        routes = np.array(
+            [int(ipaddress.ip_address(value)) for value in IPV4_LOOKUPS],
+            dtype=np.int64,
+        )
+        values = rng.integers(0, 2**32, size=count, dtype=np.uint32).astype(
+            np.int64
+        )
+        values[::3] = routes[np.arange(count)[::3] % len(routes)]
+
+        serial = np.empty(count, dtype=np.int64)
+        parallel = np.empty(count, dtype=np.int64)
+
+        def find(results, n):
+            lib().mmd_find_ipv4_many(
+                reader._address,
+                reader._buffer_size,
+                values.ctypes.data,
+                n,
+                metadata.node_count,
+                metadata.record_size,
+                reader._ipv4_start if metadata.ip_version == 6 else 0,
+                results.ctypes.data,
+            )
+
+        find(serial, threshold - 1)
+        find(parallel, count)
+        assert np.array_equal(serial[: threshold - 1], parallel[: threshold - 1])
+
+
+def test_parallel_mixed_kernel_output_identical_to_serial():
+    """Same serial/parallel comparison for the mixed IPv4/IPv6 entry point."""
+    from maxminddb._lib import lib
+
+    path = DATA / "GeoIP2-City-Test.mmdb"
+    # Mirrors `PARALLEL_THRESHOLD` in src/maxminddb.mojo.
+    threshold = 262_144
+    count = threshold + 4096
+    with maxminddb.open_database(path) as reader:
+        metadata = reader.metadata()
+        ipv4 = [ipaddress.ip_address(value) for value in IPV4_LOOKUPS]
+        ipv6 = [ipaddress.ip_address(value) for value in IPV6_LOOKUPS]
+        addresses = [
+            (ipv4 if index % 2 else ipv6)[
+                index % (len(ipv4) if index % 2 else len(ipv6))
+            ]
+            for index in range(count)
+        ]
+        packed = np.zeros((count, 16), dtype=np.uint8)
+        bit_counts = np.empty(count, dtype=np.int64)
+        start_nodes = np.empty(count, dtype=np.int64)
+        for index, address in enumerate(addresses):
+            raw = address.packed
+            packed[index, : len(raw)] = np.frombuffer(raw, dtype=np.uint8)
+            bit_counts[index] = address.max_prefixlen
+            start_nodes[index] = (
+                reader._ipv4_start
+                if metadata.ip_version == 6 and address.version == 4
+                else 0
+            )
+
+        def find(n):
+            pointers = np.empty(n, dtype=np.int64)
+            prefixes = np.empty(n, dtype=np.int64)
+            statuses = np.empty(n, dtype=np.int64)
+            lib().mmd_find_many(
+                reader._address,
+                reader._buffer_size,
+                packed.ctypes.data,
+                bit_counts.ctypes.data,
+                start_nodes.ctypes.data,
+                n,
+                metadata.node_count,
+                metadata.record_size,
+                pointers.ctypes.data,
+                prefixes.ctypes.data,
+                statuses.ctypes.data,
+            )
+            return pointers, prefixes, statuses
+
+        serial = find(threshold - 1)
+        parallel = find(count)
+        for serial_part, parallel_part in zip(serial, parallel):
+            assert np.array_equal(serial_part, parallel_part[: threshold - 1])
 
 
 def test_repeated_cached_records_are_independent():

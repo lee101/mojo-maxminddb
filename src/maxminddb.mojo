@@ -5,11 +5,23 @@ ABI as Int values and are rebuilt as concrete, mutable-origin pointers here.
 """
 
 from std.sys import simd_width_of
+from max.algorithm import parallelize
 
 comptime BPtr = Pointer[UInt8, AnyOrigin[mut=True]]
 comptime IPtr = Pointer[Int64, AnyOrigin[mut=True]]
-comptime PARALLEL_THRESHOLD = 16_384
-comptime PARALLEL_CHUNKS = 16
+
+# Parallel dispatch only pays for itself above the batches callers usually
+# pass. Measured on this host (see "Parallel phase" in README.md): the whole
+# 50k-miss batch walks in ~2 ms and 16k in ~0.6 ms, while a `parallelize`
+# dispatch costs ~4-6 ms per call on the shared host, so batches below
+# PARALLEL_THRESHOLD stay serial. First measured win was at ~175k-200k; the
+# threshold is 2^18, a margin above it. Keep this in step with the test that
+# calls the kernel either side of the threshold on the same input.
+comptime PARALLEL_THRESHOLD = 262_144
+# Four workers: on a four-CPU allowance 8 and 16 workers are indistinguishable
+# from 4, so the extra scaling seen on the shared host is scheduler luck, not
+# throughput (README "Parallel phase").
+comptime PARALLEL_WORKERS = 4
 
 
 def read_node(
@@ -447,26 +459,26 @@ def mmd_find_ipv4_many(
     var results = IPtr(unsafe_from_address=results_addr)
 
     if count >= PARALLEL_THRESHOLD:
-        var chunk_size = (count + PARALLEL_CHUNKS - 1) // PARALLEL_CHUNKS
+        # Each chunk owns a disjoint slice of `results`, so the workers never
+        # touch the same output word; the walk itself is read-only.
+        var chunk_size = (count + PARALLEL_WORKERS - 1) // PARALLEL_WORKERS
 
-        @__parameter
-        def run_chunk(chunk: Int):
+        def run_chunk(chunk: Int) {imm}:
             var begin = chunk * chunk_size
-            var end = min(begin + chunk_size, count)
-            find_ipv4_range(
-                database,
-                database_size,
-                values,
-                node_count,
-                record_size,
-                start_node,
-                results,
-                begin,
-                end,
-            )
+            if begin < count:
+                find_ipv4_range(
+                    database,
+                    database_size,
+                    values,
+                    node_count,
+                    record_size,
+                    start_node,
+                    results,
+                    begin,
+                    min(begin + chunk_size, count),
+                )
 
-        for chunk in range(PARALLEL_CHUNKS):
-            run_chunk(chunk)
+        parallelize(run_chunk, PARALLEL_WORKERS, PARALLEL_WORKERS)
     else:
         find_ipv4_range(
             database,
@@ -532,17 +544,18 @@ def mmd_find_many(
         )
 
     if count >= PARALLEL_THRESHOLD:
-        var chunk_size = (count + PARALLEL_CHUNKS - 1) // PARALLEL_CHUNKS
+        # Each worker writes only its own `pointers`/`prefixes`/`statuses`
+        # slots (index `i` belongs to exactly one chunk), so the slices are
+        # disjoint and the result is identical to the serial loop.
+        var chunk_size = (count + PARALLEL_WORKERS - 1) // PARALLEL_WORKERS
 
-        @__parameter
-        def run_chunk(chunk: Int):
+        def run_chunk(chunk: Int) {imm}:
             var begin = chunk * chunk_size
-            var end = min(begin + chunk_size, count)
-            for i in range(begin, end):
-                run_one(i)
+            if begin < count:
+                for i in range(begin, min(begin + chunk_size, count)):
+                    run_one(i)
 
-        for chunk in range(PARALLEL_CHUNKS):
-            run_chunk(chunk)
+        parallelize(run_chunk, PARALLEL_WORKERS, PARALLEL_WORKERS)
     else:
         for i in range(count):
             run_one(i)
