@@ -196,6 +196,75 @@ def find_value(
     return Int64((pointer << 8) | bit_index)
 
 
+def _ipv4_record[stride: Int, width: Int](
+    database: BPtr,
+    node: Int,
+    bit: Int,
+) -> Int:
+    """Reassemble one 24- or 32-bit record; `width` unrolls to fixed loads."""
+    var value = 0
+    for k in range(width):
+        value = (
+            value << 8
+        ) | Int(database.unsafe_load(node * stride + bit * width + k))
+    return value
+
+
+def _ipv4_28_record(database: BPtr, node: Int, bit: Int) -> Int:
+    """Reassemble one 28-bit record.
+
+    The two records of a node share byte 3: the left record's high nibble is
+    the high nibble of that byte, the right record's the low nibble.
+    """
+    var offset = node * 7
+    if bit == 0:
+        return (
+            (Int(database.unsafe_load(offset + 3)) >> 4) << 24
+            | Int(database.unsafe_load(offset)) << 16
+            | Int(database.unsafe_load(offset + 1)) << 8
+            | Int(database.unsafe_load(offset + 2))
+        )
+    return (
+        (Int(database.unsafe_load(offset + 3)) & 0x0F) << 24
+        | Int(database.unsafe_load(offset + 4)) << 16
+        | Int(database.unsafe_load(offset + 5)) << 8
+        | Int(database.unsafe_load(offset + 6))
+    )
+
+
+def _ipv4_node[record_size: Int](database: BPtr, node: Int, bit: Int) -> Int:
+    if record_size == 28:
+        return _ipv4_28_record(database, node, bit)
+    if record_size == 24:
+        return _ipv4_record[6, 3](database, node, bit)
+    return _ipv4_record[8, 4](database, node, bit)
+
+
+def _ipv4_pack(node_count: Int, node: Int, depth: Int) -> Int64:
+    """Pointer and prefix packed exactly as `find_value` returns them."""
+    if node < node_count:
+        return -3
+    var pointer = 0 if node == node_count else node
+    return Int64((pointer << 8) | depth)
+
+
+def _ipv4_lane[record_size: Int](
+    database: BPtr,
+    node_count: Int,
+    start_node: Int,
+    address: Int,
+) -> Int64:
+    """One address, walked exactly as `find_value` walks it."""
+    var node = start_node
+    var bit_index = 0
+    while bit_index < 32 and node < node_count:
+        node = _ipv4_node[record_size](
+            database, node, (address >> (31 - bit_index)) & 1
+        )
+        bit_index += 1
+    return _ipv4_pack(node_count, node, bit_index)
+
+
 def find_ipv4_simd[W: Int](
     database: BPtr,
     database_size: Int,
@@ -207,45 +276,34 @@ def find_ipv4_simd[W: Int](
     base: Int,
 ):
     var addresses = values.unsafe_load[width=W](base)
-    var nodes = SIMD[DType.int64, W](start_node)
-    var depths = SIMD[DType.int64, W](0)
-    var statuses = SIMD[DType.int64, W](0)
 
-    for bit_index in range(32):
-        var active = statuses.eq(SIMD[DType.int64, W](0)) & (
-            nodes.lt(SIMD[DType.int64, W](node_count))
-        )
-        if active.cast[DType.int64]().reduce_add() == 0:
-            break
-        var bits = (
-            addresses >> SIMD[DType.int64, W](31 - bit_index)
-        ) & SIMD[DType.int64, W](1)
-        for lane in range(W):
-            if active[lane]:
-                var node = read_node(
-                    database,
-                    database_size,
-                    Int(nodes[lane]),
-                    Int(bits[lane]),
-                    record_size,
-                )
-                if node < 0:
-                    statuses[lane] = Int64(node)
-                else:
-                    nodes[lane] = Int64(node)
-                    depths[lane] += 1
-
+    # The W addresses of this group are independent, so they arrive as one
+    # vector load and each lane walks its own address with the scalar kernel's
+    # walk: `_ipv4_lane` is `find_value`'s IPv4 form with the record-size
+    # dispatch specialised per width, so the per-lane walk condition, the
+    # record reassembly and the (pointer << 8 | depth) pack are the same code
+    # for the scalar and batch entry points, not a re-derivation of it.
+    #
+    # Per bit a lane's next node depends on the record it just read, so the
+    # dependent-load chain bounds the walk; widening the lane loop cannot
+    # shorten it. What the group does buy is width dispatch once per group,
+    # unpacking once per group, and no per-lane status/pointer buffers.
     var encoded = SIMD[DType.int64, W](0)
-    for lane in range(W):
-        if statuses[lane] != 0:
-            encoded[lane] = statuses[lane]
-        elif nodes[lane] < Int64(node_count):
-            encoded[lane] = -3
-        else:
-            var pointer = (
-                0 if nodes[lane] == Int64(node_count) else Int(nodes[lane])
+    if record_size == 24:
+        for lane in range(W):
+            encoded[lane] = _ipv4_lane[24](
+                database, node_count, start_node, Int(addresses[lane])
             )
-            encoded[lane] = Int64((pointer << 8) | Int(depths[lane]))
+    elif record_size == 28:
+        for lane in range(W):
+            encoded[lane] = _ipv4_lane[28](
+                database, node_count, start_node, Int(addresses[lane])
+            )
+    elif record_size == 32:
+        for lane in range(W):
+            encoded[lane] = _ipv4_lane[32](
+                database, node_count, start_node, Int(addresses[lane])
+            )
     results.unsafe_store(base, encoded)
 
 

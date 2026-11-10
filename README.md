@@ -101,11 +101,74 @@ the same checked-in GeoIP2 City database and the best of three runs.
 | batch `get_many`, 10k GeoIP2 hits | 172.36 ms | 1668.87 ms | 9.68x |
 | batch get + prefix, 50k miss-heavy | 31.15 ms | 255.99 ms | 8.22x |
 
+### SIMD phase: batch kernel before and after
+
+Measured 2026-11-10 on the workspace machine (Intel Xeon E5-2697 v4, Linux
+6.8.0-147-generic, Python 3.13.14). "Before" is `HEAD`'s
+`src/maxminddb.mojo`; "after" is this tree. Both columns are whole
+`bench/bench.py` cases, and the two libraries were run **interleaved** in one
+session (`MOJO_MAXMINDDB_LIB` selects the `.so`) so machine drift hits both:
+three rounds of old-then-new, then three rounds of new-then-old.
+
+| case | before (ms, 3 runs) | after (ms, 3 runs) | median, 6 runs |
+| --- | --- | --- | --- |
+| batch `get_many`, 50k miss-heavy | 37.21, 38.86, 38.74 / 38.45, 38.97, 39.37 | 34.59, 35.20, 35.00 / 34.13, 34.54, 36.00 | 38.80 -> 34.80, **-10.3%** |
+| batch get + prefix, 50k miss-heavy | 35.42, 34.76, 35.55 / 34.99, 35.76, 35.18 | 32.11, 32.08, 35.57 / 32.77, 32.68, 30.92 | 35.30 -> 32.39, **-8.2%** |
+| batch `get_many`, 10k GeoIP2 hits | 178.11, 180.38, 174.82 / 201.76, 184.46, 186.84 | 178.18, 185.24, 176.45 / 177.78, 178.33, 172.21 | 182.42 -> 177.98, -2.4% |
+| scalar `get`, 50k miss-heavy | 123.91, 127.16, 128.78 / 126.52, 127.16, 129.88 | 133.61, 121.42, 119.44 / 123.62, 129.45, 123.24 | 127.16 -> 123.43, within spread |
+| scalar `get`, 10k GeoIP2 hits | 187.81, 188.45, 186.14 / 185.53, 188.89, 203.06 | 188.33, 201.74, 189.85 / 184.65, 190.62, 191.40 | 188.13 -> 190.24, within spread |
+
+The kernel alone, called directly at bench.py's sizes (no decode, no result
+list, best of seven, `bench/_kernel_ab.py`, old and new libraries swapped to
+rule out ordering):
+
+| kernel call | before | after | ratio |
+| --- | ---: | ---: | ---: |
+| `mmd_find_ipv4_many`, 50k misses | 4.92 / 4.94 ms | 1.98 ms | 2.5x faster |
+| `mmd_find_ipv4_many`, 10k hits | 3.53 / 3.47 ms | 1.03 ms | 3.4x faster |
+
+The 10k-hit case barely moves: its 10k-record clone-and-decode (~170 ms of
+the ~180 ms; the decoded-record templates are rebuilt per address) dominates
+it, and the 50k-miss total is dominated by `ctypes` and result-list work, not
+by the kernel. The two miss-heavy batch cases carry the kernel win end to
+end; the hit case shows it only in the kernel row above.
+
+What changed in the kernel, and what did not survive `pixi run bench`:
+
+- **Kept:** the IPv4 batch group walk. Each lane previously re-entered
+  `read_node` per bit -- so `record_size` was re-compared, the index re-checked
+  and the byte range re-validated for every lane-bit -- and the patch update
+  ran *after* the loop. `_ipv4_lane` is now `find_value`'s IPv4 walk with the
+  record width specialised per group, shared by the scalar and batch entry
+  points. That is also what fixed a real bug: the old group walk reported the
+  neighbouring lane's depth (it advanced one bit past the stop bit and did not
+  mask stopped lanes), so batches that mixed hit and miss lanes returned
+  prefix lengths from the wrong lane. The 10k-hit and 50k-miss results above
+  changed no further once that was correct.
+- **Rejected: lockstep masked gather.** Walking the four lanes of a group
+  in lockstep with one whole-record gather per step was 3.4x *slower* than
+  the lane walk on both bench sizes (`bench/_kernel_ab.py`): a tree walk is a
+  dependent-load chain, and masking lanes that stop at different depths does
+  not shorten it while the gather costs more than the four scalar loads. It
+  is not in the tree.
+- **Rejected: faster Python staging.** Replacing the per-address encode loop
+  in `get_with_prefix_len_many` with vectorised row writes is 6.75x faster in
+  isolation (107.8 -> 16.0 ms at 50k mixed), and `_ip` instead of
+  `int(address)` halves the `np.fromiter` (7.34 -> 3.50 ms). Neither moved the
+  public call beyond its noise: the mixed path is ~50 ms of staging plus
+  ~950 ms of the same record cloning as `get`, and a mixed 50k
+  `get_with_prefix_len_many` measured 1097.7/1075.2 ms before and
+  1025.0/1079.8 ms after. Both were reverted rather than kept on the strength
+  of a microbenchmark.
+
 Scalar traversal passes the address bits directly as integer arguments and
 returns pointer and prefix in one value, avoiding temporary NumPy arrays and
 three `ctypes` result objects per call. IPv4 lookup uses a dedicated five-argument
 ABI and dispatches the database record width once before traversing the trie.
-Homogeneous IPv4 batches traverse SIMD-width groups and use a scalar tail.
+Homogeneous IPv4 batches load each SIMD-width group of addresses as one vector
+and walk the group's lanes against a width-specialised walk, with a scalar
+tail; the walk itself is the tree's dependent-load chain, one bit at a time
+(see the SIMD phase section below for what a lockstep gather measured).
 Batches of at least 16,384 addresses are split into 16 coarse parallel chunks;
 smaller batches stay serial.
 

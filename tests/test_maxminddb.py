@@ -276,8 +276,9 @@ def test_batch_lookup_matches_scalar_and_upstream(upstream_maxminddb):
 
 
 @pytest.mark.parametrize("record_size", [24, 28, 32])
-@pytest.mark.parametrize("count", [1, 3, 5, 9, 17])
+@pytest.mark.parametrize("count", [0, 1, 2, 3, 4, 5, 9, 17, 1001])
 def test_ipv4_batch_simd_tail_matches_scalar(record_size, count):
+    """0, 1, W-1, W, W+1 and a large odd length (W = 4 on this toolchain)."""
     path = DATA / f"MaxMind-DB-test-ipv4-{record_size}.mmdb"
     values = [
         ipaddress.ip_address(IPV4_LOOKUPS[index % len(IPV4_LOOKUPS)])
@@ -286,6 +287,28 @@ def test_ipv4_batch_simd_tail_matches_scalar(record_size, count):
     with maxminddb.open_database(path) as reader:
         expected = [reader.get_with_prefix_len(value) for value in values]
         assert reader.get_with_prefix_len_many(values) == expected
+
+
+@pytest.mark.parametrize("record_size", [24, 28, 32])
+@pytest.mark.parametrize("count", [0, 1, 3, 4, 5, 7, 8, 9, 15, 16, 17, 1001])
+def test_batch_vector_boundaries(record_size, count):
+    """Batch lengths around the SIMD width, with uneven hit depths.
+
+    Most test-fixture addresses return at prefixes 28-32, while a group of
+    consecutive ones mixes hits (stops at a data node) and misses (stops with
+    a node still inside the tree). A group walk that assumes one shared stop
+    step reports the neighbouring lane's depth instead of its own.
+    """
+    path = DATA / f"MaxMind-DB-test-ipv4-{record_size}.mmdb"
+    values = [
+        ipaddress.ip_address(IPV4_LOOKUPS[index % len(IPV4_LOOKUPS)])
+        for index in range(count)
+    ]
+    with maxminddb.open_database(path) as reader:
+        expected = [reader.get_with_prefix_len(value) for value in values]
+        assert reader.get_with_prefix_len_many(values) == expected
+        assert reader.get_many(values) == [record for record, _ in expected]
+
 
 
 @pytest.mark.parametrize("count", [16383, 16384])
